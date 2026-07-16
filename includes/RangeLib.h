@@ -923,7 +923,13 @@ namespace ranges {
 	{
 	public:
 		RayMarching(OMap m, float mr) : RangeMethod(m, mr) { distImage = DistanceTransform(&m); }
-		
+
+		#if COUNT_RM_HOPS == 1
+		// count of while-loop iterations ("k") in the most recent calc_range call.
+		// single-threaded diagnostic only, not used by the timing benchmark.
+		long hop_count = 0;
+		#endif
+
 		float ANIL calc_range(float x, float y, float heading) {
 			float x0 = x;
 			float y0 = y;
@@ -935,7 +941,13 @@ namespace ranges {
 			int py = 0;
 
 			float t = 0.0;
+			#if COUNT_RM_HOPS == 1
+			hop_count = 0;
+			#endif
 			while (t < max_range) {
+				#if COUNT_RM_HOPS == 1
+				hop_count++;
+				#endif
 				px = x0 + ray_direction_x * t;
 				py = y0 + ray_direction_y * t;
 
