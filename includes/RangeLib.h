@@ -1914,7 +1914,110 @@ namespace ranges {
 		#endif
 		std::vector<std::vector<std::vector<lut_t> > > giant_lut;
 	};
-} 
+
+	// GPU-backed GiantLUTCast. Additive companion to RayMarchingGPU (above); shaped exactly like it:
+	// a batched numpy_calc_range_angles that offloads to a CUDA class, plus the CPU eval_sensor_model /
+	// set_sensor_model inherited unchanged from RangeMethod (same pairing RayMarchingGPU relies on --
+	// numpy_calc_range_angles for GPU ranges, base eval_sensor_model for the weight accumulate).
+	//
+	// It does NOT reuse GiantLUTCast's nested std::vector giant_lut (not contiguous, so not
+	// cudaMemcpy-able, and its protected member is not exposed). Instead it builds its own flat,
+	// contiguous uint16_t table here at construction -- reusing GiantLUTCast's own precompute logic
+	// (RayMarching seed cast over every (x,y,theta_bin), quantized to uint16 under the library's
+	// default _GIANT_LUT_SHORT_DATATYPE flag) -- and uploads it once to the GPU. Layout matches the
+	// kernel: (x*height + y)*theta_discretization + theta_bin.
+	//
+	// Purpose: the single missing experiment -- a GPU LUT (thousands of concurrent single-hop
+	// gathers) vs. the CPU LUT's serial, DRAM-latency-bound gathers. Not compile-tested (no local
+	// nvcc); written by careful analogy to the proven RayMarchingGPU / RayMarchingCUDA pair.
+	class GiantLUTCastGPU : public RangeMethod
+	{
+	public:
+		typedef uint16_t lut_t;  // fixed to the short datatype -- see build note above.
+
+		GiantLUTCastGPU(OMap m, float mr, int td) : RangeMethod(m, mr), theta_discretization(td) {
+			#if USE_CUDA == 1
+			// cached scaling/quantization constants (mirror GiantLUTCast under _USE_CACHED_CONSTANTS):
+			float M_2PI_div_theta_discretization = M_2PI / ((float) theta_discretization);
+			float limits_div_max = std::numeric_limits<uint16_t>::max() / max_range;   // build:  r -> uint16
+			float max_div_limits = max_range / std::numeric_limits<uint16_t>::max();   // lookup: uint16 -> r
+
+			// Build the flat, contiguous LUT host-side, filling it directly (no nested vectors).
+			// Same seed cast + loop nest as GiantLUTCast's constructor; slow (~64s, one-time build cost,
+			// not per-query) -- fine, matches the CPU LUT method's setup.
+			std::vector<uint16_t> flat_lut((size_t)m.width * (size_t)m.height * (size_t)theta_discretization);
+			RayMarching seed_cast = RayMarching(m, mr);
+			for (int x = 0; x < m.width; ++x) {
+				for (int y = 0; y < m.height; ++y) {
+					for (int i = 0; i < theta_discretization; ++i) {
+						float angle = i * M_2PI_div_theta_discretization;
+						float r = seed_cast.calc_range(x, y, angle);
+						r = std::min(max_range, r);
+						uint16_t val = r * limits_div_max;
+						flat_lut[((size_t)x * m.height + y) * theta_discretization + i] = val;
+					}
+				}
+			}
+
+			glc = new GiantLUTCastCUDA(flat_lut.data(), m.width, m.height, theta_discretization, max_range, max_div_limits);
+
+			#if ROS_WORLD_TO_GRID_CONVERSION == 1
+			glc->set_conversion_params(m.world_scale, m.world_angle, m.world_origin_x, m.world_origin_y,
+				m.world_sin_angle, m.world_cos_angle);
+			#endif
+			#else
+			throw std::string("Must compile with -DWITH_CUDA=ON to use this class.");
+			#endif
+		}
+
+		~GiantLUTCastGPU() {
+			#if USE_CUDA == 1
+			delete glc;
+			#else
+			throw std::string("Must compile with -DWITH_CUDA=ON to use this class.");
+			#endif
+		}
+
+		// Batched-only, like RayMarchingGPU -- single queries aren't supported here (the table lives
+		// on the GPU). The benchmark generates its synthetic observation with a separate CPU method.
+		float calc_range(float x, float y, float heading) {
+			#if USE_CUDA == 1
+			std::cout << "Do not call calc_range on GiantLUTCastGPU, requires batched queries" << std::endl;
+			return -1.0;
+			#else
+			throw std::string("Must compile with -DWITH_CUDA=ON to use this class.");
+			#endif
+		}
+
+		// Deliberately simple: one call -> one GiantLUTCastCUDA launch, processing exactly what's
+		// passed. No internal auto-chunking (that's the ceil-based overflow bug avoided in
+		// RayMarchingGPU::numpy_calc_range_angles). Callers that exceed CHUNK_SIZE must split
+		// externally with a floor-sized batch -- see mcl_bench_lutgpu.cpp.
+		void numpy_calc_range_angles(float * ins, float * angles, float * outs, int num_particles, int num_angles) {
+			#if USE_CUDA == 1
+			#if ROS_WORLD_TO_GRID_CONVERSION == 0
+			std::cout << "Cannot use GPU numpy_calc_range_angles without ROS_WORLD_TO_GRID_CONVERSION == 1" << std::endl;
+			return;
+			#endif
+			glc->numpy_calc_range_angles(ins, angles, outs, num_particles, num_angles);
+			#else
+			throw std::string("Must compile with -DWITH_CUDA=ON to use this class.");
+			#endif
+		}
+
+		// set_sensor_model and eval_sensor_model are inherited unchanged from RangeMethod -- the CPU
+		// sensor-model path RayMarchingGPU also uses. No GPU sensor-table upload here (this class only
+		// accelerates the range lookup, matching how the benchmark times it).
+
+		int memory() { return (int)((size_t)map.width * map.height * theta_discretization * sizeof(uint16_t)); }
+
+	protected:
+		int theta_discretization;
+		#if USE_CUDA == 1
+		GiantLUTCastCUDA * glc = 0;
+		#endif
+	};
+}
 
 namespace benchmark {
 	template <class range_T>

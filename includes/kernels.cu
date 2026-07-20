@@ -313,3 +313,109 @@ void RayMarchingCUDA::calc_range_repeat_angles_eval_sensor_model(float * ins, fl
 	std::cout << "GPU numpy_calc_range_angles only works with ROS world to grid conversion enabled" << std::endl;
 	#endif
 }
+
+// ============================================================================
+// GiantLUTCastCUDA -- GPU-backed GiantLUTCast (additive; nothing above is modified).
+//
+// Same world->grid front-end as cuda_ray_marching_angles_world_to_grid, but the ray-march inner
+// loop is replaced by a single O(1) flat gather into the precomputed giant LUT. This is the
+// missing "GPU LUT" experiment: thousands of concurrent, cheap, single-hop table gathers instead
+// of one CPU thread doing them serially. Correctness here is by careful analogy to the proven
+// ray-marching angles kernel + the CPU GiantLUTCast::calc_range path -- it has not been compiled.
+// ============================================================================
+
+#ifndef M_2PI
+#define M_2PI 6.28318530718
+#endif
+
+// Mirror of GiantLUTCast::discretize_theta (RangeLib.h) under the library's default flags:
+// _USE_ALTERNATE_MOD == 1, _USE_CACHED_CONSTANTS == 1, _USE_FAST_ROUND == 0.
+__device__ int glt_discretize_theta(float theta, int theta_discretization) {
+	if (theta < 0.0f) {
+		while (theta < 0.0f) theta += (float)M_2PI;
+	} else if (theta > (float)M_2PI) {
+		while (theta > (float)M_2PI) theta -= (float)M_2PI;
+	}
+	int rounded = (int) roundf(theta * ((float)theta_discretization / (float)M_2PI));
+	int binned = rounded % theta_discretization;
+	return binned;
+}
+
+// One thread per (particle, angle) query, exactly like cuda_ray_marching_angles_world_to_grid.
+// lut layout: (x*height + y)*theta_discretization + theta_bin, uint16_t values.
+__global__ void cuda_giant_lut_lookup_angles(float * ins, float * outs, uint16_t * lut,
+	int width, int height, int theta_discretization, float max_range, float max_div_limits,
+	int num_particles, int num_angles,
+	float world_origin_x, float world_origin_y, float world_scale, float inv_world_scale,
+	float world_sin_angle, float world_cos_angle, float rotation_const) {
+	int ind = blockIdx.x*blockDim.x + threadIdx.x;
+	if (ind >= num_angles*num_particles) return;
+
+	int angle_ind = fmodf( ind, num_angles );
+	int particle_ind = (float) ind / (float) num_angles;
+
+	float x_world = ins[particle_ind*3];
+	float y_world = ins[particle_ind*3+1];
+	float theta_world = ins[particle_ind*3+2];
+
+	// convert x0,y0,theta from world to grid space coordinates
+	float x0 = (x_world - world_origin_x) * inv_world_scale;
+	float y0 = (y_world - world_origin_y) * inv_world_scale;
+	float temp = x0;
+	x0 = world_cos_angle*x0 - world_sin_angle*y0;
+	y0 = world_sin_angle*temp + world_cos_angle*y0;
+	float theta = -theta_world + rotation_const - ins[num_particles * 3 + angle_ind];
+
+	// swap components (matches the CPU path: base numpy_calc_range_angles calls calc_range(y, x, ...))
+	temp = x0;
+	x0 = y0;
+	y0 = temp;
+
+	// LUT lookup. Bounds check on the float coords, mirroring GiantLUTCast::calc_range exactly
+	// (so e.g. -0.5 is rejected before truncating to 0).
+	float out;
+	if (x0 < 0 || x0 >= width || y0 < 0 || y0 >= height) {
+		out = max_range;
+	} else {
+		int px = (int) x0;
+		int py = (int) y0;
+		int bin = glt_discretize_theta(theta, theta_discretization);
+		uint16_t val = lut[(px*height + py)*theta_discretization + bin];
+		out = val * max_div_limits;
+	}
+	outs[ind] = out * world_scale;
+}
+
+GiantLUTCastCUDA::GiantLUTCastCUDA(uint16_t *flat_lut, int w, int h, int td, float mr, float mdl)
+	: width(w), height(h), theta_discretization(td), max_range(mr), max_div_limits(mdl) {
+	cudaMalloc((void **)&d_ins, sizeof(float) * CHUNK_SIZE * 3);
+	cudaMalloc((void **)&d_outs, sizeof(float) * CHUNK_SIZE);
+
+	size_t lut_count = (size_t)width * (size_t)height * (size_t)theta_discretization;
+	cudaMalloc((void **)&d_lut, sizeof(uint16_t) * lut_count);
+	cudaMemcpy(d_lut, flat_lut, sizeof(uint16_t) * lut_count, cudaMemcpyHostToDevice);
+}
+
+GiantLUTCastCUDA::~GiantLUTCastCUDA() {
+	cudaFree(d_ins); cudaFree(d_outs); cudaFree(d_lut);
+}
+
+// num_particles*num_angles must be <= CHUNK_SIZE (caller enforces this; see mcl_bench_lutgpu.cpp).
+void GiantLUTCastCUDA::numpy_calc_range_angles(float * ins, float * angles, float * outs, int num_particles, int num_angles) {
+	#if ROS_WORLD_TO_GRID_CONVERSION == 1
+	// copy queries to GPU buffer
+	cudaMemcpy(d_ins, ins, sizeof(float) * num_particles * 3,cudaMemcpyHostToDevice);
+	// also copy angles to end of GPU buffer, this assumes there is enough space (which there should be)
+	cudaMemcpy(&d_ins[num_particles * 3], angles, sizeof(float) * num_angles,cudaMemcpyHostToDevice);
+	// execute queries on the GPU, have to pass coordinate space conversion constants
+	cuda_giant_lut_lookup_angles<<< CHUNK_SIZE / NUM_THREADS, NUM_THREADS >>>(d_ins, d_outs, d_lut,
+		width, height, theta_discretization, max_range, max_div_limits, num_particles, num_angles,
+		world_origin_x, world_origin_y, world_scale, inv_world_scale, world_sin_angle, world_cos_angle, rotation_const);
+	err_check();
+	// copy results back to CPU
+	cudaMemcpy(outs,d_outs,sizeof(float)*num_particles*num_angles,cudaMemcpyDeviceToHost);
+	cudaDeviceSynchronize();
+	#else
+	std::cout << "GPU numpy_calc_range_angles only works with ROS world to grid conversion enabled" << std::endl;
+	#endif
+}
