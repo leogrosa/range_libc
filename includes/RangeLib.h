@@ -873,6 +873,17 @@ namespace ranges {
 			#endif
 		}
 
+		// Additive (PFandPIM, 2026-09-30): unified-memory (no cudaMemcpy) variant -- see
+		// RayMarchingCUDA::numpy_calc_range_angles_unified in CudaRangeLib.h for the buffer contract.
+		// One call = one launch, no internal chunking: num_particles*num_angles must be <= CHUNK_SIZE.
+		void numpy_calc_range_angles_unified(float * ins_and_angles, float * outs, int num_particles, int num_angles) {
+			#if USE_CUDA == 1
+			rmc->numpy_calc_range_angles_unified(ins_and_angles, outs, num_particles, num_angles);
+			#else
+			throw std::string("Must compile with -DWITH_CUDA=ON to use this class.");
+			#endif
+		}
+
 		#if SENSOR_MODEL_HELPERS == 1
 		#if USE_CUDA == 1
 		void set_sensor_model(double *table, int table_width) {

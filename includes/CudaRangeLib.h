@@ -1,5 +1,6 @@
 #include <vector>
 #include <cstdint>
+#include <cstddef>
 
 #ifndef ROS_WORLD_TO_GRID_CONVERSION
 #define ROS_WORLD_TO_GRID_CONVERSION 1
@@ -18,6 +19,14 @@ public:
 	void numpy_calc_range(float *ins, float *outs, int num_casts);
 	void numpy_calc_range_angles(float * ins, float * angles, float * outs, int num_particles, int num_angles);
 	void calc_range_repeat_angles_eval_sensor_model(float * ins, float * angles, float * obs, double * weights, int num_particles, int num_angles);
+
+	// Additive (PFandPIM, 2026-09-30): no-cudaMemcpy variant of numpy_calc_range_angles for
+	// unified-memory SoCs (Jetson), where host and device share the same physical DRAM.
+	// ins_and_angles/outs must be managed buffers (cuda_managed_alloc_floats below);
+	// ins_and_angles holds num_particles*3 poses immediately followed by num_angles angles --
+	// the same layout the kernel already reads from d_ins. Same kernel, same CHUNK_SIZE launch,
+	// same blocking-per-call behaviour as numpy_calc_range_angles: only the copies are gone.
+	void numpy_calc_range_angles_unified(float * ins_and_angles, float * outs, int num_particles, int num_angles);
 
 	void set_sensor_table(double *sensor_table, int table_width);
 
@@ -61,6 +70,11 @@ private:
 	bool constants_set = false;
 	#endif
 };
+
+// Additive (PFandPIM, 2026-09-30): managed (unified) memory helpers, so host code compiled
+// without CUDA headers can allocate buffers the GPU reads/writes in place.
+float *cuda_managed_alloc_floats(size_t n);
+void cuda_managed_free(void *p);
 
 // GPU-backed GiantLUTCast. Additive companion to RayMarchingCUDA above -- same overall shape
 // (device query/output buffers, world->grid conversion params, a single batched

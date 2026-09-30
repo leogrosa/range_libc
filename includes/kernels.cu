@@ -419,3 +419,37 @@ void GiantLUTCastCUDA::numpy_calc_range_angles(float * ins, float * angles, floa
 	std::cout << "GPU numpy_calc_range_angles only works with ROS world to grid conversion enabled" << std::endl;
 	#endif
 }
+
+// ============================================================================
+// Additive (PFandPIM, 2026-09-30): unified-memory RMGPU entry point + managed-memory helpers.
+// See CudaRangeLib.h. Nothing above is modified.
+// ============================================================================
+
+void RayMarchingCUDA::numpy_calc_range_angles_unified(float * ins_and_angles, float * outs, int num_particles, int num_angles) {
+	#if ROS_WORLD_TO_GRID_CONVERSION == 1
+	// no cudaMemcpy in or out: the kernel reads the caller's managed poses+angles and writes its
+	// managed output directly. Launch config deliberately identical to numpy_calc_range_angles.
+	cuda_ray_marching_angles_world_to_grid<<< CHUNK_SIZE / NUM_THREADS, NUM_THREADS >>>(ins_and_angles, outs, d_distMap, width, height, max_range,
+		num_particles, num_angles, world_origin_x, world_origin_y, world_scale, inv_world_scale, world_sin_angle, world_cos_angle, rotation_const);
+	err_check();
+	// block like the copy version does (its D->H cudaMemcpy is synchronous) -- and the host must not
+	// touch managed memory while a kernel runs on pre-Pascal GPUs like the Nano/TX1's Maxwell anyway.
+	cudaDeviceSynchronize();
+	#else
+	std::cout << "GPU numpy_calc_range_angles only works with ROS world to grid conversion enabled" << std::endl;
+	#endif
+}
+
+float *cuda_managed_alloc_floats(size_t n) {
+	float *p = 0;
+	cudaError_t err = cudaMallocManaged((void **)&p, sizeof(float) * n);
+	if (err != cudaSuccess) {
+		printf("cudaMallocManaged failed: %s\n", cudaGetErrorString(err));
+		return 0;
+	}
+	return p;
+}
+
+void cuda_managed_free(void *p) {
+	cudaFree(p);
+}
