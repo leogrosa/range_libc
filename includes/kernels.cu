@@ -453,3 +453,17 @@ float *cuda_managed_alloc_floats(size_t n) {
 void cuda_managed_free(void *p) {
 	cudaFree(p);
 }
+
+void GiantLUTCastCUDA::numpy_calc_range_angles_unified(float * ins_and_angles, float * outs, int num_particles, int num_angles) {
+	#if ROS_WORLD_TO_GRID_CONVERSION == 1
+	// no cudaMemcpy in or out -- see RayMarchingCUDA::numpy_calc_range_angles_unified. Launch config
+	// deliberately identical to GiantLUTCastCUDA::numpy_calc_range_angles.
+	cuda_giant_lut_lookup_angles<<< CHUNK_SIZE / NUM_THREADS, NUM_THREADS >>>(ins_and_angles, outs, d_lut,
+		width, height, theta_discretization, max_range, max_div_limits, num_particles, num_angles,
+		world_origin_x, world_origin_y, world_scale, inv_world_scale, world_sin_angle, world_cos_angle, rotation_const);
+	err_check();
+	cudaDeviceSynchronize();
+	#else
+	std::cout << "GPU numpy_calc_range_angles only works with ROS world to grid conversion enabled" << std::endl;
+	#endif
+}

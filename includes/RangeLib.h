@@ -2016,6 +2016,16 @@ namespace ranges {
 			#endif
 		}
 
+		// Additive (PFandPIM, 2026-09-30): unified-memory (no cudaMemcpy) variant, same contract as
+		// RayMarchingGPU::numpy_calc_range_angles_unified. num_particles*num_angles <= CHUNK_SIZE.
+		void numpy_calc_range_angles_unified(float * ins_and_angles, float * outs, int num_particles, int num_angles) {
+			#if USE_CUDA == 1
+			glc->numpy_calc_range_angles_unified(ins_and_angles, outs, num_particles, num_angles);
+			#else
+			throw std::string("Must compile with -DWITH_CUDA=ON to use this class.");
+			#endif
+		}
+
 		// set_sensor_model and eval_sensor_model are inherited unchanged from RangeMethod -- the CPU
 		// sensor-model path RayMarchingGPU also uses. No GPU sensor-table upload here (this class only
 		// accelerates the range lookup, matching how the benchmark times it).

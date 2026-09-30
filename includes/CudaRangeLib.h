@@ -99,6 +99,12 @@ public:
 	// chunking to keep a call under CHUNK_SIZE is the caller's responsibility (mcl_bench_lutgpu.cpp).
 	void numpy_calc_range_angles(float * ins, float * angles, float * outs, int num_particles, int num_angles);
 
+	// Additive (PFandPIM, 2026-09-30): no-cudaMemcpy variant, same contract as
+	// RayMarchingCUDA::numpy_calc_range_angles_unified above (managed ins_and_angles = poses then
+	// angles; managed outs; one launch, blocks until done). The LUT itself stays in device memory,
+	// uploaded once at construction -- only the per-call query/result copies are removed.
+	void numpy_calc_range_angles_unified(float * ins_and_angles, float * outs, int num_particles, int num_angles);
+
 	#if ROS_WORLD_TO_GRID_CONVERSION == 1
 	void set_conversion_params(float w_scale, float w_angle, float w_origin_x,
 		float w_origin_y, float w_sin_angle, float w_cos_angle) {
