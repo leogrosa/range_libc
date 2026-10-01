@@ -467,3 +467,57 @@ void GiantLUTCastCUDA::numpy_calc_range_angles_unified(float * ins_and_angles, f
 	std::cout << "GPU numpy_calc_range_angles only works with ROS world to grid conversion enabled" << std::endl;
 	#endif
 }
+
+// ============================================================================
+// Additive (PFandPIM, 2026-10-01): GPU sensor-model weighting. See SensorModelCUDA in
+// CudaRangeLib.h. Nothing above is modified.
+// ============================================================================
+
+// One thread per particle. Clamping and table indexing mirror mcl_convergence.cpp's CPU
+// weighting loop exactly (clamp to [0, table_width-1] in float, truncate to int).
+__global__ void cuda_eval_sensor_weights(const float * ranges, const float * obs,
+	const double * sensor_table, double * weights, int num_particles, int num_rays, int table_width) {
+	int i = blockIdx.x*blockDim.x + threadIdx.x;
+	if (i >= num_particles) return;
+
+	const float hi = (float)table_width - 1.0f;
+	double weight = 1.0;
+	for (int a = 0; a < num_rays; ++a) {
+		float r = fminf(fmaxf(obs[a], 0.0f), hi);
+		float d = fminf(fmaxf(ranges[i*num_rays + a], 0.0f), hi);
+		weight *= sensor_table[(int)r * table_width + (int)d];
+	}
+	weights[i] = weight;
+}
+
+SensorModelCUDA::SensorModelCUDA(const double *sensor_table, int tw) : table_width(tw) {
+	size_t count = (size_t)table_width * (size_t)table_width;
+	cudaMalloc((void **)&d_table, sizeof(double) * count);
+	cudaMemcpy(d_table, sensor_table, sizeof(double) * count, cudaMemcpyHostToDevice);
+	err_check();
+}
+
+SensorModelCUDA::~SensorModelCUDA() {
+	cudaFree(d_table);
+}
+
+void SensorModelCUDA::eval_weights_unified(const float *ranges, const float *obs, double *weights,
+	int num_particles, int num_rays) {
+	int blocks = (num_particles + NUM_THREADS - 1) / NUM_THREADS;
+	cuda_eval_sensor_weights<<< blocks, NUM_THREADS >>>(ranges, obs, d_table, weights,
+		num_particles, num_rays, table_width);
+	err_check();
+	// same reason as numpy_calc_range_angles_unified: the host reads weights right after, and
+	// must not touch managed memory while a kernel runs on the Nano's pre-Pascal GPU.
+	cudaDeviceSynchronize();
+}
+
+double *cuda_managed_alloc_doubles(size_t n) {
+	double *p = 0;
+	cudaError_t err = cudaMallocManaged((void **)&p, sizeof(double) * n);
+	if (err != cudaSuccess) {
+		printf("cudaMallocManaged failed: %s\n", cudaGetErrorString(err));
+		return 0;
+	}
+	return p;
+}

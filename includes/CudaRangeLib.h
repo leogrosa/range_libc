@@ -142,3 +142,31 @@ private:
 	bool constants_set = false;
 	#endif
 };
+// Additive (PFandPIM, 2026-10-01): GPU sensor-model weighting, the second half of the measurement
+// update. Range-method independent: it only needs the n*num_rays predicted ranges a cast kernel
+// already wrote, the num_rays observed ranges, and the sensor table. One thread per particle,
+// each multiplying its num_rays table entries in double (a product of ~60 probabilities underflows
+// float) -- same arithmetic and order as the CPU weighting loop in mcl_convergence.cpp, so results
+// should match it exactly. The sensor table is uploaded once at construction, like the giant LUT.
+// (The original cuda_eval_sensor_table above is unused and not reused: one thread per ray angle,
+// looping over all particles, with a broken ranges index.)
+class SensorModelCUDA
+{
+public:
+	// sensor_table: host buffer of table_width*table_width doubles, row = observed range,
+	// column = predicted range (both in px), same layout as the CPU table.
+	SensorModelCUDA(const double *sensor_table, int table_width);
+	~SensorModelCUDA();
+
+	// ranges (n*num_rays, particle-major), obs (num_rays) and weights (n) must be managed buffers
+	// (cuda_managed_alloc_floats / cuda_managed_alloc_doubles). One launch sized to the work
+	// (ceil(n / NUM_THREADS) blocks, not the fixed CHUNK_SIZE grid), blocks until done.
+	void eval_weights_unified(const float *ranges, const float *obs, double *weights,
+		int num_particles, int num_rays);
+
+private:
+	double *d_table;
+	int table_width;
+};
+
+double *cuda_managed_alloc_doubles(size_t n);
