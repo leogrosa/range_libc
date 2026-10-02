@@ -1902,6 +1902,38 @@ namespace ranges {
 			#endif
 		}
 
+		// Flat, contiguous copy of giant_lut in GiantLUTCastGPU's layout,
+		// (x*height + y)*theta_discretization + theta_bin, plus the matching
+		// stored-value -> range scaling, so a caller can reproduce calc_range
+		// exactly with the lookup address as pure arithmetic (no dependent loads
+		// through the nested vectors' headers). Used by mcl_convergence's
+		// --lut-layout flat / --prefetch-batch experiments.
+		std::vector<lut_t> flat_lut() const {
+			const size_t width = giant_lut.size();
+			const size_t height = giant_lut[0].size();
+			std::vector<lut_t> flat(width * height * (size_t)theta_discretization);
+			for (size_t x = 0; x < width; ++x)
+				for (size_t y = 0; y < height; ++y)
+					std::copy(giant_lut[x][y].begin(), giant_lut[x][y].end(),
+						flat.begin() + (x * height + y) * theta_discretization);
+			return flat;
+		}
+
+		int theta_bins() const { return theta_discretization; }
+
+		// Same scaling as calc_range's return statements, branch for branch.
+		float lut_to_range(lut_t v) const {
+			#if _GIANT_LUT_SHORT_DATATYPE
+				#if _USE_CACHED_CONSTANTS
+			return v * max_div_limits;
+				#else
+			return max_range * v / std::numeric_limits<uint16_t>::max();
+				#endif
+			#else
+			return v;
+			#endif
+		}
+
 		DistanceTransform *get_slice(float theta) {
 			int width = giant_lut.size();
 			int height = giant_lut[0].size();
